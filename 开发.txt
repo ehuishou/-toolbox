@@ -1,0 +1,2013 @@
+我需要一个工具箱，包括图片转文字，语音转文字，简单的视频剪辑，pdf等各种格式转换，还有记账等，主要是在手机上使用的app
+
+这个需求可以做，但要先说清一件事：这五类功能的技术难度差得很远。记账和 OCR 是纯本地、一两天能出雏形的；Office 格式转换基本不可能纯端侧完成，必须有服务端。所以建议分期，而不是一次全上。
+
+下面是我的方案。
+
+## 技术选型
+
+**Flutter** 单套代码覆盖 iOS + Android。理由是这几个功能都强依赖原生能力（相机、麦克风、文件、FFmpeg），Flutter 的插件生态在这块比 React Native 成熟，而写两套原生不值得。
+
+## 各功能的实现路径
+
+**图片转文字（OCR）**
+端侧用 Google ML Kit 文字识别，`google_mlkit_text_recognition`，免费、离线、中文识别可用。精度要求高的场景（复杂排版、手写）再接云端 OCR 作为可选项。
+
+**语音转文字（ASR）**
+- 实时录音转写：`speech_to_text`，直接调系统能力（iOS Speech / Android SpeechRecognizer），免费但长音频有时长限制。
+- 转写本地音频文件：需要 whisper.cpp 或 sherpa-onnx 通过 FFI 集成，模型文件几十到上百 MB，效果好但包体积和首次下载要处理。
+
+**简单视频剪辑**
+FFmpeg 是唯一实际选择，能覆盖裁剪、拼接、压缩、水印、抽音频、转 GIF。两个坑要提前知道：官方 `ffmpeg_kit_flutter` 已经停止维护，需要用社区 fork 或自己编译；min-gpl 版本会让安装包增加 20-40MB，并且 GPL 授权对闭源分发有约束，选 LGPL 版本更稳妥。
+
+**格式转换**
+这块要拆开看：
+- 图片 ↔ PDF、PDF 拆分合并加密：本地可做，`pdf` + `syncfusion_flutter_pdf`
+- 图片格式互转：本地 `image` 包搞定
+- 音视频格式转换：复用 FFmpeg
+- Office ↔ PDF：必须服务端，Gotenberg 或 LibreOffice headless，这是唯一需要后端的功能
+
+**记账**
+纯本地：SQLite（`drift`）存流水，`fl_chart` 出图表。可以复用 OCR 模块做小票识别自动填单，这是这个工具箱组合起来的额外价值。
+
+## 架构
+
+monorepo + 模块化，每个工具是独立 feature 包，共享一个 core 层负责文件选择、权限、任务队列、历史记录。首页宫格入口。这样加新工具不会互相牵连，也方便后面按需拆分。
+
+所有能端侧跑的都端侧跑，用户文件不出手机。
+
+## 分期建议
+
+- 第一期：记账 + 图片转文字 + 图片/PDF 互转。全本地、无后端、能独立发布。
+- 第二期：语音转文字 + 视频剪辑。引入大模型和 FFmpeg，处理包体积。
+- 第三期：Office 格式转换。这时候才需要搭后端。
+
+---
+先做一个记账app并留出后续开发空间
+
+## 目录结构
+
+```
+toolbox/
+├── pubspec.yaml
+└── lib/
+    ├── main.dart
+    ├── app.dart
+    ├── core/                          # 所有工具共享
+    │   ├── tool/
+    │   │   ├── tool_descriptor.dart   # 工具元数据
+    │   │   ├── tool_module.dart        # 模块契约
+    │   │   └── tool_registry.dart      # 注册表
+    │   ├── database/
+    │   │   └── app_database.dart       # Drift 汇总入口
+    │   ├── router/
+    │   │   └── app_router.dart
+    │   ├── theme/
+    │   │   └── app_theme.dart
+    │   ├── ui/
+    │   │   ├── app_icons.dart          # 图标 key 映射
+    │   │   └── coming_soon_page.dart   # 未开发工具占位
+    │   └── util/
+    │       └── money.dart              # 金额格式化
+    └── features/
+        ├── home/
+        │   └── home_page.dart
+        └── ledger/                     # 记账（第一个工具）
+            ├── ledger_module.dart
+            ├── data/
+            │   ├── ledger_tables.dart
+            │   └── ledger_dao.dart
+            └── presentation/
+                ├── ledger_providers.dart
+                ├── ledger_page.dart
+                ├── entry_editor_page.dart
+                └── widgets/
+                    ├── entry_list.dart
+                    ├── stats_view.dart
+                    └── amount_keypad.dart
+```
+
+## pubspec.yaml
+
+```yaml
+name: toolbox
+description: 多功能工具箱
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+
+  flutter_riverpod: 2.5.1
+  go_router: 14.2.7
+
+  drift: 2.20.3
+  sqlite3_flutter_libs: 0.5.24
+  path_provider: 2.1.4
+  path: 1.9.0
+
+  fl_chart: 0.69.0
+  intl: 0.19.0
+  collection: 1.18.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: 4.0.0
+  build_runner: 2.4.13
+  drift_dev: 2.20.3
+
+flutter:
+  uses-material-design: true
+```
+
+## Core：工具契约
+
+`lib/core/tool/tool_descriptor.dart`
+
+```dart
+import 'package:flutter/material.dart';
+
+/// 工具的开发状态。未完成的工具也注册进来，首页会显示占位卡片。
+enum ToolStatus { available, comingSoon }
+
+enum ToolCategory {
+  life('生活'),
+  text('文字识别'),
+  media('音视频'),
+  document('文档');
+
+  const ToolCategory(this.label);
+  final String label;
+}
+
+/// 工具在首页的展示信息。纯数据，不含逻辑。
+@immutable
+class ToolDescriptor {
+  const ToolDescriptor({
+    required this.id,
+    required this.name,
+    required this.description,
+    required this.icon,
+    required this.color,
+    required this.route,
+    required this.category,
+    this.status = ToolStatus.available,
+  });
+
+  final String id;
+  final String name;
+  final String description;
+  final IconData icon;
+  final Color color;
+  final String route;
+  final ToolCategory category;
+  final ToolStatus status;
+
+  bool get isAvailable => status == ToolStatus.available;
+}
+```
+
+`lib/core/tool/tool_module.dart`
+
+```dart
+import 'package:go_router/go_router.dart';
+
+import 'tool_descriptor.dart';
+
+/// 每个工具实现这个契约。新增工具只需实现它并注册到 toolModules。
+abstract class ToolModule {
+  const ToolModule();
+
+  ToolDescriptor get descriptor;
+
+  /// 该工具的全部路由，会被挂载到根路由下。
+  List<RouteBase> get routes;
+
+  /// 需要预热的资源（模型下载、FFmpeg 初始化等）在这里做。
+  Future<void> onAppStart() async {}
+}
+```
+
+`lib/core/tool/tool_registry.dart`
+
+```dart
+import 'package:collection/collection.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+
+import '../ui/coming_soon_page.dart';
+import '../../features/ledger/ledger_module.dart';
+import 'tool_descriptor.dart';
+import 'tool_module.dart';
+
+/// 唯一需要修改的注册点。
+///
+/// 新工具做好后：实现 ToolModule，加到这个 list，首页和路由自动生效。
+const List<ToolModule> toolModules = <ToolModule>[
+  LedgerModule(),
+
+  // 第二期：把下面的占位换成真实模块即可
+  _PlannedTool(
+    id: 'ocr',
+    name: '图片转文字',
+    description: '拍照或选图，提取文字',
+    icon: Icons.document_scanner_outlined,
+    color: Color(0xFF3B82F6),
+    category: ToolCategory.text,
+  ),
+  _PlannedTool(
+    id: 'asr',
+    name: '语音转文字',
+    description: '录音实时转写',
+    icon: Icons.mic_none_outlined,
+    color: Color(0xFF8B5CF6),
+    category: ToolCategory.media,
+  ),
+  _PlannedTool(
+    id: 'video',
+    name: '视频剪辑',
+    description: '裁剪、压缩、提取音频',
+    icon: Icons.movie_creation_outlined,
+    color: Color(0xFFEC4899),
+    category: ToolCategory.media,
+  ),
+  _PlannedTool(
+    id: 'convert',
+    name: '格式转换',
+    description: 'PDF、图片、音视频互转',
+    icon: Icons.swap_horiz_rounded,
+    color: Color(0xFF14B8A6),
+    category: ToolCategory.document,
+  ),
+];
+
+/// 未开发工具的通用占位模块，点进去是"开发中"页面。
+class _PlannedTool extends ToolModule {
+  const _PlannedTool({
+    required this.id,
+    required this.name,
+    required this.description,
+    required this.icon,
+    required this.color,
+    required this.category,
+  });
+
+  final String id;
+  final String name;
+  final String description;
+  final IconData icon;
+  final Color color;
+  final ToolCategory category;
+
+  @override
+  ToolDescriptor get descriptor => ToolDescriptor(
+        id: id,
+        name: name,
+        description: description,
+        icon: icon,
+        color: color,
+        route: '/$id',
+        category: category,
+        status: ToolStatus.comingSoon,
+      );
+
+  @override
+  List<RouteBase> get routes => [
+        GoRoute(
+          path: '/$id',
+          builder: (_, __) => ComingSoonPage(title: name),
+        ),
+      ];
+}
+
+class ToolRegistry {
+  const ToolRegistry(this.modules);
+
+  final List<ToolModule> modules;
+
+  List<ToolDescriptor> get descriptors =>
+      modules.map((m) => m.descriptor).toList();
+
+  /// 按分类分组，首页据此渲染分区。
+  Map<ToolCategory, List<ToolDescriptor>> get grouped =>
+      groupBy(descriptors, (ToolDescriptor d) => d.category);
+
+  List<RouteBase> get routes => modules.expand((m) => m.routes).toList();
+
+  Future<void> warmUp() async {
+    for (final module in modules) {
+      await module.onAppStart();
+    }
+  }
+}
+
+final toolRegistryProvider = Provider<ToolRegistry>(
+  (_) => const ToolRegistry(toolModules),
+);
+```
+
+## Core：数据库
+
+表定义放在各 feature 里，这里只做汇总。Drift 要求单一 database 类，所以新工具的表加到 `tables` 和 `daos` 数组即可。
+
+`lib/core/database/app_database.dart`
+
+```dart
+import 'dart:io';
+
+import 'package:drift/drift.dart';
+import 'package:drift/native.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+
+import '../../features/ledger/data/ledger_dao.dart';
+import '../../features/ledger/data/ledger_tables.dart';
+
+part 'app_database.g.dart';
+
+@DriftDatabase(
+  // 新工具的表加在这里
+  tables: [Accounts, Categories, LedgerEntries],
+  daos: [LedgerDao],
+)
+class AppDatabase extends _$AppDatabase {
+  AppDatabase() : super(_openConnection());
+
+  AppDatabase.forTesting(super.executor);
+
+  @override
+  int get schemaVersion => 1;
+
+  @override
+  MigrationStrategy get migration => MigrationStrategy(
+        onCreate: (m) async {
+          await m.createAll();
+          await _seedCategories();
+          await _seedAccounts();
+        },
+        // 后续加表时：schemaVersion++ 并在这里写 onUpgrade
+        beforeOpen: (details) async {
+          await customStatement('PRAGMA foreign_keys = ON');
+        },
+      );
+
+  Future<void> _seedCategories() async {
+    const expense = <(String, String, int)>[
+      ('餐饮', 'food', 0xFFF97316),
+      ('交通', 'transport', 0xFF3B82F6),
+      ('购物', 'shopping', 0xFFEC4899),
+      ('居住', 'home', 0xFF8B5CF6),
+      ('娱乐', 'entertainment', 0xFF06B6D4),
+      ('医疗', 'medical', 0xFFEF4444),
+      ('学习', 'education', 0xFF10B981),
+      ('其他', 'other', 0xFF64748B),
+    ];
+    const income = <(String, String, int)>[
+      ('工资', 'salary', 0xFF10B981),
+      ('奖金', 'bonus', 0xFFF59E0B),
+      ('理财', 'investment', 0xFF6366F1),
+      ('其他', 'other', 0xFF64748B),
+    ];
+
+    await batch((b) {
+      var order = 0;
+      for (final (name, icon, color) in expense) {
+        b.insert(
+          categories,
+          CategoriesCompanion.insert(
+            name: name,
+            iconKey: icon,
+            colorValue: color,
+            kind: const Value(EntryKind.expense),
+            sortOrder: Value(order++),
+            isBuiltIn: const Value(true),
+          ),
+        );
+      }
+      order = 0;
+      for (final (name, icon, color) in income) {
+        b.insert(
+          categories,
+          CategoriesCompanion.insert(
+            name: name,
+            iconKey: icon,
+            colorValue: color,
+            kind: const Value(EntryKind.income),
+            sortOrder: Value(order++),
+            isBuiltIn: const Value(true),
+          ),
+        );
+      }
+    });
+  }
+
+  Future<void> _seedAccounts() async {
+    await batch((b) {
+      b.insertAll(accounts, [
+        AccountsCompanion.insert(
+          name: '现金',
+          iconKey: 'cash',
+          colorValue: 0xFF10B981,
+          sortOrder: const Value(0),
+        ),
+        AccountsCompanion.insert(
+          name: '银行卡',
+          iconKey: 'bank',
+          colorValue: 0xFF3B82F6,
+          sortOrder: const Value(1),
+        ),
+        AccountsCompanion.insert(
+          name: '移动支付',
+          iconKey: 'wallet',
+          colorValue: 0xFFF59E0B,
+          sortOrder: const Value(2),
+        ),
+      ]);
+    });
+  }
+}
+
+QueryExecutor _openConnection() {
+  return LazyDatabase(() async {
+    final dir = await getApplicationDocumentsDirectory();
+    final file = File(p.join(dir.path, 'toolbox.sqlite'));
+    return NativeDatabase.createInBackground(file);
+  });
+}
+
+final appDatabaseProvider = Provider<AppDatabase>((ref) {
+  final db = AppDatabase();
+  ref.onDispose(db.close);
+  return db;
+});
+```
+
+## 记账：表结构
+
+金额统一用 `int` 存**分**，避免浮点误差。这条一开始不定好，后面对账会一直有 0.01 的差。
+
+`lib/features/ledger/data/ledger_tables.dart`
+
+```dart
+import 'package:drift/drift.dart';
+
+enum EntryKind { expense, income, transfer }
+
+@DataClassName('Account')
+class Accounts extends Table {
+  IntColumn get id => integer().autoIncrement()();
+  TextColumn get name => text().withLength(min: 1, max: 30)();
+  TextColumn get iconKey => text().withDefault(const Constant('wallet'))();
+  IntColumn get colorValue => integer()();
+
+  /// 初始余额，当前余额 = 初始余额 + 流水汇总
+  IntColumn get openingBalanceCents => integer().withDefault(const Constant(0))();
+  IntColumn get sortOrder => integer().withDefault(const Constant(0))();
+  BoolColumn get isArchived => boolean().withDefault(const Constant(false))();
+}
+
+@DataClassName('Category')
+class Categories extends Table {
+  IntColumn get id => integer().autoIncrement()();
+  TextColumn get name => text().withLength(min: 1, max: 20)();
+  TextColumn get iconKey => text()();
+  IntColumn get colorValue => integer()();
+  TextColumn get kind => textEnum<EntryKind>()();
+
+  /// 预留二级分类
+  IntColumn get parentId => integer().nullable().references(Categories, #id)();
+  IntColumn get sortOrder => integer().withDefault(const Constant(0))();
+  BoolColumn get isBuiltIn => boolean().withDefault(const Constant(false))();
+  BoolColumn get isArchived => boolean().withDefault(const Constant(false))();
+}
+
+/// 表名不叫 Transactions，避免和 Drift 自带的 Transaction 类冲突。
+@DataClassName('LedgerEntry')
+class LedgerEntries extends Table {
+  IntColumn get id => integer().autoIncrement()();
+  TextColumn get kind => textEnum<EntryKind>()();
+
+  /// 正数存储，方向由 kind 决定
+  IntColumn get amountCents => integer()();
+
+  IntColumn get categoryId => integer().nullable().references(Categories, #id)();
+  IntColumn get accountId => integer().references(Accounts, #id)();
+
+  /// 转账的目标账户
+  IntColumn get toAccountId => integer().nullable().references(Accounts, #id)();
+
+  TextColumn get note => text().withDefault(const Constant(''))();
+  DateTimeColumn get occurredAt => dateTime()();
+
+  /// 小票图片路径，留给后续 OCR 自动填单
+  TextColumn get attachmentPath => text().nullable()();
+
+  DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+  DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
+
+  /// 软删除，为将来的多端同步留位
+  DateTimeColumn get deletedAt => dateTime().nullable()();
+
+  @override
+  List<Set<Column>> get uniqueKeys => [];
+}
+```
+
+## 记账：DAO
+
+`lib/features/ledger/data/ledger_dao.dart`
+
+```dart
+import 'package:drift/drift.dart';
+
+import '../../../core/database/app_database.dart';
+import 'ledger_tables.dart';
+
+/// 一条流水 + 关联的分类和账户
+class EntryDetail {
+  const EntryDetail({
+    required this.entry,
+    this.category,
+    this.account,
+    this.toAccount,
+  });
+
+  final LedgerEntry entry;
+  final Category? category;
+  final Account? account;
+  final Account? toAccount;
+
+  /// 有符号金额，用于余额计算
+  int get signedCents =>
+      entry.kind == EntryKind.income ? entry.amountCents : -entry.amountCents;
+}
+
+class PeriodSummary {
+  const PeriodSummary({this.incomeCents = 0, this.expenseCents = 0});
+
+  final int incomeCents;
+  final int expenseCents;
+
+  int get balanceCents => incomeCents - expenseCents;
+}
+
+class CategoryTotal {
+  const CategoryTotal({
+    required this.categoryId,
+    required this.name,
+    required this.iconKey,
+    required this.colorValue,
+    required this.totalCents,
+  });
+
+  final int? categoryId;
+  final String name;
+  final String iconKey;
+  final int colorValue;
+  final int totalCents;
+}
+
+@DriftAccessor(tables: [Accounts, Categories, LedgerEntries])
+class LedgerDao extends DatabaseAccessor<AppDatabase> with _$LedgerDaoMixin {
+  LedgerDao(super.db);
+
+  Expression<bool> _alive() => ledgerEntries.deletedAt.isNull();
+
+  Stream<List<EntryDetail>> watchEntries({
+    required DateTime start,
+    required DateTime end,
+  }) {
+    final toAccounts = alias(accounts, 'to_account');
+
+    final query = select(ledgerEntries).join([
+      leftOuterJoin(
+        categories,
+        categories.id.equalsExp(ledgerEntries.categoryId),
+      ),
+      leftOuterJoin(accounts, accounts.id.equalsExp(ledgerEntries.accountId)),
+      leftOuterJoin(
+        toAccounts,
+        toAccounts.id.equalsExp(ledgerEntries.toAccountId),
+      ),
+    ])
+      ..where(
+        ledgerEntries.occurredAt.isBiggerOrEqualValue(start) &
+            ledgerEntries.occurredAt.isSmallerThanValue(end) &
+            _alive(),
+      )
+      ..orderBy([
+        OrderingTerm.desc(ledgerEntries.occurredAt),
+        OrderingTerm.desc(ledgerEntries.id),
+      ]);
+
+    return query.watch().map(
+          (rows) => rows
+              .map(
+                (row) => EntryDetail(
+                  entry: row.readTable(ledgerEntries),
+                  category: row.readTableOrNull(categories),
+                  account: row.readTableOrNull(accounts),
+                  toAccount: row.readTableOrNull(toAccounts),
+                ),
+              )
+              .toList(),
+        );
+  }
+
+  Stream<PeriodSummary> watchSummary({
+    required DateTime start,
+    required DateTime end,
+  }) {
+    final total = ledgerEntries.amountCents.sum();
+
+    final query = selectOnly(ledgerEntries)
+      ..addColumns([ledgerEntries.kind, total])
+      ..where(
+        ledgerEntries.occurredAt.isBiggerOrEqualValue(start) &
+            ledgerEntries.occurredAt.isSmallerThanValue(end) &
+            _alive(),
+      )
+      ..groupBy([ledgerEntries.kind]);
+
+    return query.watch().map((rows) {
+      var income = 0;
+      var expense = 0;
+      for (final row in rows) {
+        final kind = row.read(ledgerEntries.kind);
+        final value = row.read(total) ?? 0;
+        if (kind == EntryKind.income) {
+          income = value;
+        } else if (kind == EntryKind.expense) {
+          expense = value;
+        }
+      }
+      return PeriodSummary(incomeCents: income, expenseCents: expense);
+    });
+  }
+
+  /// 分类占比，用于饼图
+  Stream<List<CategoryTotal>> watchCategoryTotals({
+    required DateTime start,
+    required DateTime end,
+    required EntryKind kind,
+  }) {
+    final total = ledgerEntries.amountCents.sum();
+
+    final query = selectOnly(ledgerEntries).join([
+      leftOuterJoin(
+        categories,
+        categories.id.equalsExp(ledgerEntries.categoryId),
+      ),
+    ])
+      ..addColumns([
+        ledgerEntries.categoryId,
+        categories.name,
+        categories.iconKey,
+        categories.colorValue,
+        total,
+      ])
+      ..where(
+        ledgerEntries.occurredAt.isBiggerOrEqualValue(start) &
+            ledgerEntries.occurredAt.isSmallerThanValue(end) &
+            ledgerEntries.kind.equalsValue(kind) &
+            _alive(),
+      )
+      ..groupBy([ledgerEntries.categoryId])
+      ..orderBy([OrderingTerm.desc(total)]);
+
+    return query.watch().map(
+          (rows) => rows
+              .map(
+                (row) => CategoryTotal(
+                  categoryId: row.read(ledgerEntries.categoryId),
+                  name: row.read(categories.name) ?? '未分类',
+                  iconKey: row.read(categories.iconKey) ?? 'other',
+                  colorValue: row.read(categories.colorValue) ?? 0xFF64748B,
+                  totalCents: row.read(total) ?? 0,
+                ),
+              )
+              .toList(),
+        );
+  }
+
+  Stream<List<Category>> watchCategories(EntryKind kind) {
+    return (select(categories)
+          ..where((t) => t.kind.equalsValue(kind) & t.isArchived.equals(false))
+          ..orderBy([(t) => OrderingTerm.asc(t.sortOrder)]))
+        .watch();
+  }
+
+  Stream<List<Account>> watchAccounts() {
+    return (select(accounts)
+          ..where((t) => t.isArchived.equals(false))
+          ..orderBy([(t) => OrderingTerm.asc(t.sortOrder)]))
+        .watch();
+  }
+
+  Future<int> insertEntry(LedgerEntriesCompanion entry) =>
+      into(ledgerEntries).insert(entry);
+
+  Future<bool> updateEntry(LedgerEntry entry) => update(ledgerEntries)
+      .replace(entry.copyWith(updatedAt: DateTime.now()));
+
+  Future<void> softDeleteEntry(int id) async {
+    await (update(ledgerEntries)..where((t) => t.id.equals(id))).write(
+      LedgerEntriesCompanion(deletedAt: Value(DateTime.now())),
+    );
+  }
+
+  Future<int> createCategory(CategoriesCompanion category) =>
+      into(categories).insert(category);
+}
+```
+
+## 记账：Providers
+
+`lib/features/ledger/presentation/ledger_providers.dart`
+
+```dart
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../../core/database/app_database.dart';
+import '../data/ledger_dao.dart';
+import '../data/ledger_tables.dart';
+
+final ledgerDaoProvider = Provider<LedgerDao>(
+  (ref) => ref.watch(appDatabaseProvider).ledgerDao,
+);
+
+/// 当前查看的月份，统一驱动流水列表和统计
+final selectedMonthProvider = StateProvider<DateTime>((_) {
+  final now = DateTime.now();
+  return DateTime(now.year, now.month);
+});
+
+({DateTime start, DateTime end}) _monthRange(DateTime month) => (
+      start: DateTime(month.year, month.month),
+      end: DateTime(month.year, month.month + 1),
+    );
+
+final monthEntriesProvider = StreamProvider<List<EntryDetail>>((ref) {
+  final range = _monthRange(ref.watch(selectedMonthProvider));
+  return ref
+      .watch(ledgerDaoProvider)
+      .watchEntries(start: range.start, end: range.end);
+});
+
+final monthSummaryProvider = StreamProvider<PeriodSummary>((ref) {
+  final range = _monthRange(ref.watch(selectedMonthProvider));
+  return ref
+      .watch(ledgerDaoProvider)
+      .watchSummary(start: range.start, end: range.end);
+});
+
+/// 统计页当前查看的类型（支出/收入）
+final statsKindProvider = StateProvider<EntryKind>((_) => EntryKind.expense);
+
+final categoryTotalsProvider = StreamProvider<List<CategoryTotal>>((ref) {
+  final range = _monthRange(ref.watch(selectedMonthProvider));
+  return ref.watch(ledgerDaoProvider).watchCategoryTotals(
+        start: range.start,
+        end: range.end,
+        kind: ref.watch(statsKindProvider),
+      );
+});
+
+final categoriesProvider =
+    StreamProvider.family<List<Category>, EntryKind>((ref, kind) {
+  return ref.watch(ledgerDaoProvider).watchCategories(kind);
+});
+
+final accountsProvider = StreamProvider<List<Account>>(
+  (ref) => ref.watch(ledgerDaoProvider).watchAccounts(),
+);
+```
+
+## 记账：模块声明
+
+`lib/features/ledger/ledger_module.dart`
+
+```dart
+import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
+
+import '../../core/tool/tool_descriptor.dart';
+import '../../core/tool/tool_module.dart';
+import 'data/ledger_dao.dart';
+import 'presentation/entry_editor_page.dart';
+import 'presentation/ledger_page.dart';
+
+class LedgerModule extends ToolModule {
+  const LedgerModule();
+
+  @override
+  ToolDescriptor get descriptor => const ToolDescriptor(
+        id: 'ledger',
+        name: '记账',
+        description: '收支记录与统计',
+        icon: Icons.account_balance_wallet_outlined,
+        color: Color(0xFF10B981),
+        route: '/ledger',
+        category: ToolCategory.life,
+      );
+
+  @override
+  List<RouteBase> get routes => [
+        GoRoute(
+          path: '/ledger',
+          builder: (_, __) => const LedgerPage(),
+          routes: [
+            GoRoute(
+              path: 'entry',
+              builder: (_, state) => EntryEditorPage(
+                initial: state.extra as EntryDetail?,
+              ),
+            ),
+          ],
+        ),
+      ];
+}
+```
+
+## 记账：主页面
+
+`lib/features/ledger/presentation/ledger_page.dart`
+
+```dart
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+import 'package:intl/intl.dart';
+
+import '../../../core/util/money.dart';
+import 'ledger_providers.dart';
+import 'widgets/entry_list.dart';
+import 'widgets/stats_view.dart';
+
+class LedgerPage extends ConsumerWidget {
+  const LedgerPage({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const _MonthPicker(),
+          bottom: const TabBar(
+            tabs: [Tab(text: '流水'), Tab(text: '统计')],
+          ),
+        ),
+        body: const Column(
+          children: [
+            _SummaryBar(),
+            Expanded(
+              child: TabBarView(
+                children: [EntryList(), StatsView()],
+              ),
+            ),
+          ],
+        ),
+        floatingActionButton: FloatingActionButton(
+          onPressed: () => context.push('/ledger/entry'),
+          child: const Icon(Icons.add),
+        ),
+      ),
+    );
+  }
+}
+
+class _MonthPicker extends ConsumerWidget {
+  const _MonthPicker();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final month = ref.watch(selectedMonthProvider);
+    final label = DateFormat('yyyy年M月').format(month);
+
+    void shift(int delta) {
+      ref.read(selectedMonthProvider.notifier).state =
+          DateTime(month.year, month.month + delta);
+    }
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        IconButton(
+          icon: const Icon(Icons.chevron_left),
+          onPressed: () => shift(-1),
+        ),
+        Text(label, style: const TextStyle(fontSize: 17)),
+        IconButton(
+          icon: const Icon(Icons.chevron_right),
+          onPressed: () => shift(1),
+        ),
+      ],
+    );
+  }
+}
+
+class _SummaryBar extends ConsumerWidget {
+  const _SummaryBar();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final summary = ref.watch(monthSummaryProvider);
+    final theme = Theme.of(context);
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      color: theme.colorScheme.surfaceContainerLow,
+      child: summary.when(
+        loading: () => const SizedBox(height: 44),
+        error: (e, _) => Text('加载失败：$e'),
+        data: (data) => Row(
+          children: [
+            _SummaryCell(label: '支出', cents: data.expenseCents),
+            _SummaryCell(label: '收入', cents: data.incomeCents),
+            _SummaryCell(label: '结余', cents: data.balanceCents),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SummaryCell extends StatelessWidget {
+  const _SummaryCell({required this.label, required this.cents});
+
+  final String label;
+  final int cents;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Expanded(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(label, style: theme.textTheme.bodySmall),
+          const SizedBox(height: 2),
+          Text(
+            formatCents(cents),
+            style: theme.textTheme.titleMedium
+                ?.copyWith(fontWeight: FontWeight.w600),
+          ),
+        ],
+      ),
+    );
+  }
+}
+```
+
+`lib/features/ledger/presentation/widgets/entry_list.dart`
+
+```dart
+import 'package:collection/collection.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+import 'package:intl/intl.dart';
+
+import '../../../../core/ui/app_icons.dart';
+import '../../../../core/util/money.dart';
+import '../../data/ledger_dao.dart';
+import '../../data/ledger_tables.dart';
+import '../ledger_providers.dart';
+
+class EntryList extends ConsumerWidget {
+  const EntryList({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final entries = ref.watch(monthEntriesProvider);
+
+    return entries.when(
+      loading: () => const Center(child: CircularProgressIndicator()),
+      error: (e, _) => Center(child: Text('加载失败：$e')),
+      data: (list) {
+        if (list.isEmpty) {
+          return const _EmptyState();
+        }
+
+        // 按天分组
+        final byDay = groupBy(list, (EntryDetail d) {
+          final t = d.entry.occurredAt;
+          return DateTime(t.year, t.month, t.day);
+        });
+        final days = byDay.keys.toList()..sort((a, b) => b.compareTo(a));
+
+        return ListView.builder(
+          padding: const EdgeInsets.only(bottom: 88),
+          itemCount: days.length,
+          itemBuilder: (context, index) {
+            final day = days[index];
+            final items = byDay[day]!;
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _DayHeader(day: day, items: items),
+                ...items.map((e) => _EntryTile(detail: e)),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+class _DayHeader extends StatelessWidget {
+  const _DayHeader({required this.day, required this.items});
+
+  final DateTime day;
+  final List<EntryDetail> items;
+
+  @override
+  Widget build(BuildContext context) {
+    final expense = items
+        .where((e) => e.entry.kind == EntryKind.expense)
+        .fold(0, (sum, e) => sum + e.entry.amountCents);
+    final theme = Theme.of(context);
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 6),
+      child: Row(
+        children: [
+          Text(
+            DateFormat('M月d日 EEEE', 'zh_CN').format(day),
+            style: theme.textTheme.bodyMedium
+                ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+          ),
+          const Spacer(),
+          if (expense > 0)
+            Text(
+              '支出 ${formatCents(expense)}',
+              style: theme.textTheme.bodySmall,
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _EntryTile extends ConsumerWidget {
+  const _EntryTile({required this.detail});
+
+  final EntryDetail detail;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final entry = detail.entry;
+    final isIncome = entry.kind == EntryKind.income;
+    final color = Color(detail.category?.colorValue ?? 0xFF64748B);
+
+    final subtitleParts = [
+      if (detail.account != null) detail.account!.name,
+      if (entry.note.isNotEmpty) entry.note,
+    ];
+
+    return Dismissible(
+      key: ValueKey(entry.id),
+      direction: DismissDirection.endToStart,
+      background: Container(
+        color: Theme.of(context).colorScheme.errorContainer,
+        alignment: Alignment.centerRight,
+        padding: const EdgeInsets.only(right: 20),
+        child: const Icon(Icons.delete_outline),
+      ),
+      confirmDismiss: (_) async {
+        return await showDialog<bool>(
+              context: context,
+              builder: (ctx) => AlertDialog(
+                title: const Text('删除这条记录？'),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx, false),
+                    child: const Text('取消'),
+                  ),
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx, true),
+                    child: const Text('删除'),
+                  ),
+                ],
+              ),
+            ) ??
+            false;
+      },
+      onDismissed: (_) =>
+          ref.read(ledgerDaoProvider).softDeleteEntry(entry.id),
+      child: ListTile(
+        leading: CircleAvatar(
+          backgroundColor: color.withValues(alpha: 0.15),
+          child: Icon(iconFor(detail.category?.iconKey), color: color, size: 20),
+        ),
+        title: Text(detail.category?.name ?? '未分类'),
+        subtitle: subtitleParts.isEmpty
+            ? null
+            : Text(subtitleParts.join(' · '),
+                maxLines: 1, overflow: TextOverflow.ellipsis),
+        trailing: Text(
+          '${isIncome ? '+' : '-'}${formatCents(entry.amountCents)}',
+          style: TextStyle(
+            fontSize: 16,
+            fontWeight: FontWeight.w600,
+            color: isIncome ? const Color(0xFF10B981) : null,
+          ),
+        ),
+        onTap: () => context.push('/ledger/entry', extra: detail),
+      ),
+    );
+  }
+}
+
+class _EmptyState extends StatelessWidget {
+  const _EmptyState();
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(
+            Icons.receipt_long_outlined,
+            size: 56,
+            color: Theme.of(context).colorScheme.outlineVariant,
+          ),
+          const SizedBox(height: 12),
+          const Text('这个月还没有记录'),
+        ],
+      ),
+    );
+  }
+}
+```
+
+`lib/features/ledger/presentation/widgets/stats_view.dart`
+
+```dart
+import 'package:fl_chart/fl_chart.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../../../core/ui/app_icons.dart';
+import '../../../../core/util/money.dart';
+import '../../data/ledger_tables.dart';
+import '../ledger_providers.dart';
+
+class StatsView extends ConsumerWidget {
+  const StatsView({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final kind = ref.watch(statsKindProvider);
+    final totals = ref.watch(categoryTotalsProvider);
+
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: SegmentedButton<EntryKind>(
+            segments: const [
+              ButtonSegment(value: EntryKind.expense, label: Text('支出')),
+              ButtonSegment(value: EntryKind.income, label: Text('收入')),
+            ],
+            selected: {kind},
+            onSelectionChanged: (s) =>
+                ref.read(statsKindProvider.notifier).state = s.first,
+          ),
+        ),
+        Expanded(
+          child: totals.when(
+            loading: () => const Center(child: CircularProgressIndicator()),
+            error: (e, _) => Center(child: Text('加载失败：$e')),
+            data: (list) {
+              if (list.isEmpty) {
+                return const Center(child: Text('暂无数据'));
+              }
+              final sum = list.fold(0, (s, e) => s + e.totalCents);
+
+              return ListView(
+                padding: const EdgeInsets.only(bottom: 88),
+                children: [
+                  SizedBox(
+                    height: 200,
+                    child: PieChart(
+                      PieChartData(
+                        sectionsSpace: 2,
+                        centerSpaceRadius: 56,
+                        sections: [
+                          for (final item in list)
+                            PieChartSectionData(
+                              value: item.totalCents.toDouble(),
+                              color: Color(item.colorValue),
+                              radius: 32,
+                              showTitle: false,
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  for (final item in list)
+                    _CategoryRow(
+                      name: item.name,
+                      iconKey: item.iconKey,
+                      color: Color(item.colorValue),
+                      cents: item.totalCents,
+                      ratio: sum == 0 ? 0 : item.totalCents / sum,
+                    ),
+                ],
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _CategoryRow extends StatelessWidget {
+  const _CategoryRow({
+    required this.name,
+    required this.iconKey,
+    required this.color,
+    required this.cents,
+    required this.ratio,
+  });
+
+  final String name;
+  final String iconKey;
+  final Color color;
+  final int cents;
+  final double ratio;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListTile(
+      leading: CircleAvatar(
+        backgroundColor: color.withValues(alpha: 0.15),
+        child: Icon(iconFor(iconKey), color: color, size: 20),
+      ),
+      title: Row(
+        children: [
+          Text(name),
+          const SizedBox(width: 8),
+          Text(
+            '${(ratio * 100).toStringAsFixed(1)}%',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        ],
+      ),
+      subtitle: Padding(
+        padding: const EdgeInsets.only(top: 6),
+        child: LinearProgressIndicator(
+          value: ratio,
+          minHeight: 4,
+          backgroundColor: color.withValues(alpha: 0.12),
+          valueColor: AlwaysStoppedAnimation(color),
+        ),
+      ),
+      trailing: Text(
+        formatCents(cents),
+        style: const TextStyle(fontWeight: FontWeight.w600),
+      ),
+    );
+  }
+}
+```
+
+## 记账：记一笔
+
+`lib/features/ledger/presentation/entry_editor_page.dart`
+
+```dart
+import 'package:drift/drift.dart' show Value;
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:intl/intl.dart';
+
+import '../../../core/ui/app_icons.dart';
+import '../data/ledger_dao.dart';
+import '../data/ledger_tables.dart';
+import 'ledger_providers.dart';
+import 'widgets/amount_keypad.dart';
+
+class EntryEditorPage extends ConsumerStatefulWidget {
+  const EntryEditorPage({super.key, this.initial});
+
+  /// 传入表示编辑已有记录
+  final EntryDetail? initial;
+
+  @override
+  ConsumerState<EntryEditorPage> createState() => _EntryEditorPageState();
+}
+
+class _EntryEditorPageState extends ConsumerState<EntryEditorPage> {
+  late EntryKind _kind;
+  late String _amountText;
+  late DateTime _occurredAt;
+  late TextEditingController _noteController;
+  int? _categoryId;
+  int? _accountId;
+
+  bool get _isEditing => widget.initial != null;
+
+  @override
+  void initState() {
+    super.initState();
+    final entry = widget.initial?.entry;
+    _kind = entry?.kind ?? EntryKind.expense;
+    _amountText = entry == null ? '' : (entry.amountCents / 100).toString();
+    _occurredAt = entry?.occurredAt ?? DateTime.now();
+    _categoryId = entry?.categoryId;
+    _accountId = entry?.accountId;
+    _noteController = TextEditingController(text: entry?.note ?? '');
+  }
+
+  @override
+  void dispose() {
+    _noteController.dispose();
+    super.dispose();
+  }
+
+  int? get _amountCents {
+    final value = double.tryParse(_amountText);
+    if (value == null || value <= 0) return null;
+    return (value * 100).round();
+  }
+
+  Future<void> _save() async {
+    final cents = _amountCents;
+    if (cents == null) {
+      _toast('请输入金额');
+      return;
+    }
+    if (_categoryId == null) {
+      _toast('请选择分类');
+      return;
+    }
+    if (_accountId == null) {
+      _toast('请选择账户');
+      return;
+    }
+
+    final dao = ref.read(ledgerDaoProvider);
+
+    if (_isEditing) {
+      await dao.updateEntry(
+        widget.initial!.entry.copyWith(
+          kind: _kind,
+          amountCents: cents,
+          categoryId: Value(_categoryId),
+          accountId: _accountId!,
+          note: _noteController.text.trim(),
+          occurredAt: _occurredAt,
+        ),
+      );
+    } else {
+      await dao.insertEntry(
+        LedgerEntriesCompanion.insert(
+          kind: _kind,
+          amountCents: cents,
+          categoryId: Value(_categoryId),
+          accountId: _accountId!,
+          note: Value(_noteController.text.trim()),
+          occurredAt: _occurredAt,
+        ),
+      );
+    }
+
+    if (mounted) Navigator.pop(context);
+  }
+
+  void _toast(String message) {
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final categories = ref.watch(categoriesProvider(_kind));
+    final accounts = ref.watch(accountsProvider);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(_isEditing ? '编辑记录' : '记一笔'),
+        actions: [
+          TextButton(onPressed: _save, child: const Text('保存')),
+        ],
+      ),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(12),
+            child: SegmentedButton<EntryKind>(
+              segments: const [
+                ButtonSegment(value: EntryKind.expense, label: Text('支出')),
+                ButtonSegment(value: EntryKind.income, label: Text('收入')),
+              ],
+              selected: {_kind},
+              onSelectionChanged: (s) => setState(() {
+                _kind = s.first;
+                _categoryId = null; // 分类不跨类型复用
+              }),
+            ),
+          ),
+          _AmountDisplay(text: _amountText, kind: _kind),
+          const Divider(height: 1),
+          Expanded(
+            child: ListView(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              children: [
+                categories.when(
+                  loading: () => const SizedBox(height: 100),
+                  error: (e, _) => Text('$e'),
+                  data: (list) => _CategoryGrid(
+                    categories: list,
+                    selectedId: _categoryId,
+                    onSelect: (id) => setState(() => _categoryId = id),
+                  ),
+                ),
+                const Divider(),
+                accounts.when(
+                  loading: () => const SizedBox(height: 60),
+                  error: (e, _) => Text('$e'),
+                  data: (list) => _AccountRow(
+                    accounts: list,
+                    selectedId: _accountId ??= list.firstOrNull?.id,
+                    onSelect: (id) => setState(() => _accountId = id),
+                  ),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.event_outlined),
+                  title: Text(DateFormat('yyyy-MM-dd').format(_occurredAt)),
+                  onTap: _pickDate,
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: TextField(
+                    controller: _noteController,
+                    decoration: const InputDecoration(
+                      labelText: '备注',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          AmountKeypad(
+            onKey: (key) => setState(() {
+              _amountText = applyKeypadInput(_amountText, key);
+            }),
+            onDone: _save,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _pickDate() async {
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: _occurredAt,
+      firstDate: DateTime(2000),
+      lastDate: DateTime.now().add(const Duration(days: 365)),
+    );
+    if (picked != null) {
+      setState(() => _occurredAt = DateTime(
+            picked.year,
+            picked.month,
+            picked.day,
+            _occurredAt.hour,
+            _occurredAt.minute,
+          ));
+    }
+  }
+}
+
+class _AmountDisplay extends StatelessWidget {
+  const _AmountDisplay({required this.text, required this.kind});
+
+  final String text;
+  final EntryKind kind;
+
+  @override
+  Widget build(BuildContext context) {
+    final isIncome = kind == EntryKind.income;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.baseline,
+        textBaseline: TextBaseline.alphabetic,
+        children: [
+          Text(isIncome ? '+' : '-', style: const TextStyle(fontSize: 28)),
+          const SizedBox(width: 4),
+          const Text('¥', style: TextStyle(fontSize: 22)),
+          const SizedBox(width: 4),
+          Expanded(
+            child: Text(
+              text.isEmpty ? '0.00' : text,
+              style: TextStyle(
+                fontSize: 36,
+                fontWeight: FontWeight.w600,
+                color: isIncome ? const Color(0xFF10B981) : null,
+              ),
+              textAlign: TextAlign.right,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CategoryGrid extends StatelessWidget {
+  const _CategoryGrid({
+    required this.categories,
+    required this.selectedId,
+    required this.onSelect,
+  });
+
+  final List<Category> categories;
+  final int? selectedId;
+  final ValueChanged<int> onSelect;
+
+  @override
+  Widget build(BuildContext context) {
+    return GridView.builder(
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 5,
+        childAspectRatio: 0.85,
+      ),
+      itemCount: categories.length,
+      itemBuilder: (context, index) {
+        final category = categories[index];
+        final selected = category.id == selectedId;
+        final color = Color(category.colorValue);
+
+        return InkWell(
+          onTap: () => onSelect(category.id),
+          borderRadius: BorderRadius.circular(12),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: selected ? color : color.withValues(alpha: 0.12),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  iconFor(category.iconKey),
+                  size: 22,
+                  color: selected ? Colors.white : color,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                category.name,
+                style: const TextStyle(fontSize: 11),
+                maxLines: 1,
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _AccountRow extends StatelessWidget {
+  const _AccountRow({
+    required this.accounts,
+    required this.selectedId,
+    required this.onSelect,
+  });
+
+  final List<Account> accounts;
+  final int? selectedId;
+  final ValueChanged<int> onSelect;
+
+  @override
+  Widget build(BuildContext context) {
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      child: Row(
+        children: [
+          for (final account in accounts)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: ChoiceChip(
+                label: Text(account.name),
+                avatar: Icon(iconFor(account.iconKey), size: 16),
+                selected: account.id == selectedId,
+                onSelected: (_) => onSelect(account.id),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+```
+
+`lib/features/ledger/presentation/widgets/amount_keypad.dart`
+
+```dart
+import 'package:flutter/material.dart';
+
+/// 键位。'C' 清空，'<' 退格。
+const List<String> _keys = [
+  '1', '2', '3', 'C',
+  '4', '5', '6', '<',
+  '7', '8', '9', '完成',
+  '.', '0', '00', '',
+];
+
+/// 纯函数处理输入，便于单测
+String applyKeypadInput(String current, String key) {
+  switch (key) {
+    case 'C':
+      return '';
+    case '<':
+      return current.isEmpty ? '' : current.substring(0, current.length - 1);
+    case '.':
+      if (current.contains('.')) return current;
+      return current.isEmpty ? '0.' : '$current.';
+    default:
+      // 小数位最多两位
+      final dotIndex = current.indexOf('.');
+      if (dotIndex >= 0 && current.length - dotIndex > 2) return current;
+      if (current == '0' && key != '.') return key;
+      return '$current$key';
+  }
+}
+
+class AmountKeypad extends StatelessWidget {
+  const AmountKeypad({super.key, required this.onKey, required this.onDone});
+
+  final ValueChanged<String> onKey;
+  final VoidCallback onDone;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Container(
+      color: theme.colorScheme.surfaceContainerLow,
+      padding: EdgeInsets.only(
+        bottom: MediaQuery.viewPaddingOf(context).bottom,
+      ),
+      child: GridView.builder(
+        shrinkWrap: true,
+        physics: const NeverScrollableScrollPhysics(),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 4,
+          childAspectRatio: 1.9,
+        ),
+        itemCount: _keys.length,
+        itemBuilder: (context, index) {
+          final key = _keys[index];
+          if (key.isEmpty) return const SizedBox.shrink();
+
+          final isDone = key == '完成';
+          return InkWell(
+            onTap: isDone ? onDone : () => onKey(key),
+            child: Container(
+              margin: const EdgeInsets.all(3),
+              decoration: BoxDecoration(
+                color: isDone
+                    ? theme.colorScheme.primary
+                    : theme.colorScheme.surface,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              alignment: Alignment.center,
+              child: key == '<'
+                  ? const Icon(Icons.backspace_outlined, size: 20)
+                  : Text(
+                      key,
+                      style: TextStyle(
+                        fontSize: isDone ? 15 : 20,
+                        color: isDone ? theme.colorScheme.onPrimary : null,
+                      ),
+                    ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+```
+
+## Core：剩余支撑文件
+
+`lib/core/ui/app_icons.dart` — 图标用字符串 key 存库，避免非常量 `IconData` 触发 tree-shaking 报错。
+
+```dart
+import 'package:flutter/material.dart';
+
+const Map<String, IconData> kIconMap = {
+  // 支出
+  'food': Icons.restaurant_outlined,
+  'transport': Icons.directions_bus_outlined,
+  'shopping': Icons.shopping_bag_outlined,
+  'home': Icons.home_outlined,
+  'entertainment': Icons.sports_esports_outlined,
+  'medical': Icons.local_hospital_outlined,
+  'education': Icons.school_outlined,
+  // 收入
+  'salary': Icons.payments_outlined,
+  'bonus': Icons.card_giftcard_outlined,
+  'investment': Icons.trending_up,
+  // 账户
+  'cash': Icons.money_outlined,
+  'bank': Icons.credit_card_outlined,
+  'wallet': Icons.account_balance_wallet_outlined,
+  // 兜底
+  'other': Icons.more_horiz,
+};
+
+IconData iconFor(String? key) => kIconMap[key] ?? kIconMap['other']!;
+```
+
+`lib/core/util/money.dart`
+
+```dart
+import 'package:intl/intl.dart';
+
+final NumberFormat _format = NumberFormat('#,##0.00');
+
+/// 分转成显示字符串
+String formatCents(int cents) => _format.format(cents.abs() / 100);
+
+String formatCentsSigned(int cents) =>
+    '${cents < 0 ? '-' : ''}${formatCents(cents)}';
+```
+
+`lib/core/theme/app_theme.dart`
+
+```dart
+import 'package:flutter/material.dart';
+
+const Color _seed = Color(0xFF10B981);
+
+ThemeData buildTheme(Brightness brightness) {
+  return ThemeData(
+    colorScheme: ColorScheme.fromSeed(seedColor: _seed, brightness: brightness),
+    useMaterial3: true,
+    appBarTheme: const AppBarTheme(centerTitle: true),
+  );
+}
+```
+
+`lib/core/ui/coming_soon_page.dart`
+
+```dart
+import 'package:flutter/material.dart';
+
+class ComingSoonPage extends StatelessWidget {
+  const ComingSoonPage({super.key, required this.title});
+
+  final String title;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text(title)),
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              Icons.construction_outlined,
+              size: 56,
+              color: Theme.of(context).colorScheme.outlineVariant,
+            ),
+            const SizedBox(height: 12),
+            const Text('功能开发中'),
+          ],
+        ),
+      ),
+    );
+  }
+}
+```
+
+`lib/core/router/app_router.dart`
+
+```dart
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+
+import '../../features/home/home_page.dart';
+import '../tool/tool_registry.dart';
+
+final routerProvider = Provider<GoRouter>((ref) {
+  final registry = ref.watch(toolRegistryProvider);
+
+  return GoRouter(
+    initialLocation: '/',
+    routes: [
+      GoRoute(path: '/', builder: (_, __) => const HomePage()),
+      // 所有工具路由由注册表提供
+      ...registry.routes,
+    ],
+  );
+});
+```
+
+`lib/features/home/home_page.dart`
+
+```dart
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+
+import '../../core/tool/tool_descriptor.dart';
+import '../../core/tool/tool_registry.dart';
+
+class HomePage extends ConsumerWidget {
+  const HomePage({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final grouped = ref.watch(toolRegistryProvider).grouped;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('工具箱')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          for (final entry in grouped.entries) ...[
+            Padding(
+              padding: const EdgeInsets.only(bottom: 10, top: 6),
+              child: Text(
+                entry.key.label,
+                style: Theme.of(context)
+                    .textTheme
+                    .titleSmall
+                    ?.copyWith(fontWeight: FontWeight.w600),
+              ),
+            ),
+            GridView.builder(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 4,
+                mainAxisSpacing: 8,
+                crossAxisSpacing: 8,
+                childAspectRatio: 0.82,
+              ),
+              itemCount: entry.value.length,
+              itemBuilder: (context, index) =>
+                  _ToolTile(tool: entry.value[index]),
+            ),
+            const SizedBox(height: 12),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _ToolTile extends StatelessWidget {
+  const _ToolTile({required this.tool});
+
+  final ToolDescriptor tool;
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = tool.isAvailable;
+
+    return Opacity(
+      opacity: enabled ? 1 : 0.45,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: () => context.push(tool.route),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Container(
+              width: 52,
+              height: 52,
+              decoration: BoxDecoration(
+                color: tool.color.withValues(alpha: 0.14),
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: Icon(tool.icon, color: tool.color, size: 26),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              tool.name,
+              style: const TextStyle(fontSize: 12),
+              textAlign: TextAlign.center,
+              maxLines: 2,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+```
+
+`lib/app.dart`
+
+```dart
+import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import 'core/router/app_router.dart';
+import 'core/theme/app_theme.dart';
+
+class ToolboxApp extends ConsumerWidget {
+  const ToolboxApp({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return MaterialApp.router(
+      title: '工具箱',
+      debugShowCheckedModeBanner: false,
+      routerConfig: ref.watch(routerProvider),
+      theme: buildTheme(Brightness.light),
+      darkTheme: buildTheme(Brightness.dark),
+      locale: const Locale('zh', 'CN'),
+      supportedLocales: const [Locale('zh', 'CN'), Locale('en')],
+      localizationsDelegates: const [
+        GlobalMaterialLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+        GlobalCupertinoLocalizations.delegate,
+      ],
+    );
+  }
+}
+```
+
+`lib/main.dart`
+
+```dart
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:intl/date_symbol_data_local.dart';
+
+import 'app.dart';
+import 'core/tool/tool_registry.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  initializeDateFormatting('zh_CN');
+
+  // 工具模块预热（未来 OCR 模型加载、FFmpeg 初始化在此接入）
+  await const ToolRegistry(toolModules).warmUp();
+
+  runApp(const ProviderScope(child: ToolboxApp()));
+}
+```
+
+## 跑起来
+
+```bash
+flutter create --org com.yourname --platforms=android,ios . 
+# 覆盖 pubspec.yaml 和 lib/ 后：
+flutter pub get
+dart run build_runner build --delete-conflicting-outputs
+flutter run
+```
+
+`build_runner` 会生成 `app_database.g.dart` 和 `ledger_dao.g.dart`，这两个文件不用手写也不用提交。
+
+## 后续加工具的步骤
+
+以图片转文字为例，只有三步：
+
+1. 建 `features/ocr/`，写 `OcrModule extends ToolModule`，返回 descriptor 和 routes
+2. 把 `tool_registry.dart` 里的 `_PlannedTool(id: 'ocr', ...)` 换成 `OcrModule()`
+3. 如果需要建表，把表类加到 `app_database.dart` 的 `tables` 数组，`schemaVersion` 加 1 并补 `onUpgrade`
+
+首页宫格、路由、主题都自动接上，不需要动 home 或 router 的任何代码。
+
+## 两个设计取舍需要你知道
+
+**没有做 domain/repository 分层。** 直接用 Drift 生成的数据类当模型，DAO 就是数据访问层。这个规模下再套一层 entity + mapper 只是搬砖。如果后面要接云端同步、需要本地和远端两套数据源，那时候再抽 repository 接口，成本也不高。
+
+**Drift 要求所有表在一个 database 类里声明。** 这是唯一一处模块之间的耦合点。表定义本身放在各 feature 目录下，`app_database.dart` 只做汇总引用，所以耦合限制在一行 import 加一个数组元素。

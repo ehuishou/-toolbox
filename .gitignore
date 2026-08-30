@@ -1,0 +1,25 @@
+# Flutter/Dart
+.dart_tool/
+.packages
+build/
+*.g.dart
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Platform
+android/.gradle/
+android/local.properties
+ios/Pods/
+ios/.symlinks/
+
+# 本地开发环境（SDK 与缓存，不提交）
+flutter/
+.pub-cache/
+.appdata/
+.localappdata/
+
+# 本地环境探测产生的日志
+_fv.txt

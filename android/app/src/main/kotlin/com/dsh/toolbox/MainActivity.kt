@@ -1,0 +1,5 @@
+package com.dsh.toolbox
+
+import io.flutter.embedding.android.FlutterActivity
+
+class MainActivity : FlutterActivity()
