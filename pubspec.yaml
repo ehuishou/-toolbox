@@ -16,7 +16,10 @@ dependencies:
   go_router: 14.2.7
 
   drift: 2.20.3
-  sqlite3_flutter_libs: 0.5.24
+  # 0.5.24 的 android/build.gradle 写死 compileSdkVersion 32，与其传递依赖
+  # androidx.window.extensions.core（要求 33+）冲突，release 构建失败。
+  # 0.5.42 上游已将 compileSdk 提到 35。注意不要升到 0.6.0+eol（废弃占位版本）。
+  sqlite3_flutter_libs: 0.5.42
   path_provider: 2.1.4
   path: ^1.9.1
 

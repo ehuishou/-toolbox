@@ -3,6 +3,10 @@
 .packages
 build/
 *.g.dart
+# 生成文件，含本机绝对路径（文件头自述 do not check into version control）
+.flutter-plugins-dependencies
+# flutter 工具崩溃日志
+flutter_*.log
 
 # IDE
 .idea/
