@@ -36,29 +36,68 @@ toolbox/
 
 在 Flutter 3.47.2 / Dart 3.13.2 环境下：
 
-- `flutter pub get`：成功解析 104 个依赖
+- `flutter pub get`：依赖解析成功
 - `dart run build_runner build --delete-conflicting-outputs`：成功生成 Drift 代码
 - `dart analyze lib`：**No issues found**（0 错误 0 警告）
+- `flutter test`：9 个测试全部通过
 
-## 跑起来
+APK 的实际编译与装机运行尚未验证 —— 开发机缺 Android SDK，需由 CI 或装好 SDK 的机器完成。
 
-在已安装 Flutter（Dart SDK ^3.5.0，建议 Flutter 3.27+）的机器上：
+## 打包成安卓 App
+
+应用标识：`com.dsh.toolbox`，桌面显示名「工具箱」。release 构建不申请任何权限（INTERNET 仅在 debug/profile），数据全部留在本机 SQLite。
+
+### 方式一：GitHub Actions 云端编译（本机无需 Android SDK）
+
+`.github/workflows/android-build.yml` 已配好。推到 GitHub 后自动跑 analyze + test 并编译 APK：
 
 ```bash
-# 1. 生成平台脚手架（android/ios），若当前目录尚未有 android/ ios/ 目录
-flutter create --org com.yourname --platforms=android,ios .
-
-# 2. 拉依赖
-flutter pub get
-
-# 3. 生成 Drift 代码（app_database.g.dart / ledger_dao.g.dart，无需手写）
-dart run build_runner build --delete-conflicting-outputs
-
-# 4. 运行
-flutter run
+git remote add origin <你的仓库地址>
+git push -u origin master
 ```
 
-> `build_runner` 生成的两个 `.g.dart` 文件不需要提交，已加入 `.gitignore`（`*.g.dart`）。
+在仓库的 **Actions** 标签页等构建完成，从 run 详情页底部 **Artifacts** 下载 `toolbox-apk`。解压后有两类包：
+
+- `app-release.apk` — 通用包，任何机型都能装，体积较大
+- `app-arm64-v8a-release.apk` — 现代手机基本都是这个架构，体积约小一半
+
+也可以在 Actions 页面手动点 **Run workflow** 触发（已开 `workflow_dispatch`）。
+
+传到手机后需要在系统设置里允许「安装未知来源应用」才能装。
+
+### 方式二：本机编译
+
+需要先装 Android SDK（Android Studio 或 commandline-tools）。当前这台机器 `flutter doctor` 显示 Android SDK 缺失，装好后：
+
+```bash
+flutter pub get
+dart run build_runner build --delete-conflicting-outputs
+flutter build apk --release            # 产物在 build/app/outputs/flutter-apk/
+```
+
+手机开启 USB 调试并连线后，`flutter run` 可直接装上去调试。
+
+### 正式签名（要上应用商店才需要）
+
+默认用 debug 签名，能自己装着用，但 Google Play 不接受。生成自己的 keystore：
+
+```bash
+keytool -genkey -v -keystore upload-keystore.jks -storetype JKS \
+  -keyalg RSA -keysize 2048 -validity 10000 -alias upload
+```
+
+然后建 `android/key.properties`（已在 `.gitignore` 中，不会入库）：
+
+```properties
+storePassword=<密码>
+keyPassword=<密码>
+keyAlias=upload
+storeFile=<keystore 的绝对路径>
+```
+
+`build.gradle.kts` 检测到这个文件就自动切到正式签名。keystore 一定要自己备份好，丢了就无法再给同一个应用发更新。
+
+> `build_runner` 生成的 `.g.dart` 文件不入库（`.gitignore` 里的 `*.g.dart`），CI 和本地构建都会重新生成。
 
 ## 相对原 spec 的修正
 
