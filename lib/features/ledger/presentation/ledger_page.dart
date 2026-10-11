@@ -21,6 +21,39 @@ class LedgerPage extends ConsumerWidget {
           bottom: const TabBar(
             tabs: [Tab(text: '流水'), Tab(text: '统计')],
           ),
+          actions: [
+            PopupMenuButton<String>(
+              onSelected: (value) {
+                if (value == 'import') {
+                  context.push('/ledger/import');
+                } else if (value == 'pending') {
+                  context.push('/ledger/pending');
+                }
+              },
+              itemBuilder: (context) => [
+                const PopupMenuItem(
+                  value: 'import',
+                  child: Row(
+                    children: [
+                      Icon(Icons.upload_file),
+                      SizedBox(width: 8),
+                      Text('导入账单'),
+                    ],
+                  ),
+                ),
+                const PopupMenuItem(
+                  value: 'pending',
+                  child: Row(
+                    children: [
+                      Icon(Icons.pending_actions),
+                      SizedBox(width: 8),
+                      Text('待确认账单'),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ],
         ),
         body: const Column(
           children: [

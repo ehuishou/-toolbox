@@ -4,8 +4,10 @@ import 'package:go_router/go_router.dart';
 import '../../core/tool/tool_descriptor.dart';
 import '../../core/tool/tool_module.dart';
 import 'data/ledger_dao.dart';
+import 'presentation/csv_import_page.dart';
 import 'presentation/entry_editor_page.dart';
 import 'presentation/ledger_page.dart';
+import 'presentation/pending_review_page.dart';
 
 class LedgerModule extends ToolModule {
   const LedgerModule();
@@ -32,6 +34,14 @@ class LedgerModule extends ToolModule {
               builder: (_, state) => EntryEditorPage(
                 initial: state.extra as EntryDetail?,
               ),
+            ),
+            GoRoute(
+              path: 'import',
+              builder: (_, __) => const CsvImportPage(),
+            ),
+            GoRoute(
+              path: 'pending',
+              builder: (_, __) => const PendingReviewPage(),
             ),
           ],
         ),

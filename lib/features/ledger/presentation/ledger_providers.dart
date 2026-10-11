@@ -53,3 +53,15 @@ final categoriesProvider =
 final accountsProvider = StreamProvider<List<Account>>(
   (ref) => ref.watch(ledgerDaoProvider).watchAccounts(),
 );
+
+// ===== 自动记账相关提供者 =====
+
+/// 待确认账单队列（按置信度升序，最需人工确认的在前）
+final pendingBillsProvider = StreamProvider<List<PendingBill>>(
+  (ref) => ref.watch(ledgerDaoProvider).watchPendingBills(),
+);
+
+/// CSV 导入器
+final csvImporterProvider = Provider<CsvImporter>((ref) {
+  return CsvImporter(dao: ref.watch(ledgerDaoProvider));
+});

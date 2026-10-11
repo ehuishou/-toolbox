@@ -27,12 +27,18 @@ dependencies:
   intl: ^0.20.3
   collection: ^1.19.1
 
+  # 自动记账（第一期：CSV 导入）
+  file_picker: ^8.1.0
+  csv: ^6.0.0
+  charset_converter: ^2.2.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: 4.0.0
   build_runner: 2.4.13
   drift_dev: 2.20.3
+  sqlite3: ^2.9.0
 
 flutter:
   uses-material-design: true
