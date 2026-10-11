@@ -18,7 +18,7 @@ val hasReleaseKeystore = keystoreProperties.getProperty("storeFile") != null
 
 android {
     namespace = "com.dsh.toolbox"
-    compileSdk = flutter.compileSdkVersion
+    compileSdk = 36  // file_picker 的依赖要求至少 36
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
