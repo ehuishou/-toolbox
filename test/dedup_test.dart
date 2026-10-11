@@ -4,6 +4,8 @@ import 'package:toolbox/features/ledger/data/import/bill_source.dart';
 import 'package:toolbox/features/ledger/data/ledger_tables.dart';
 import 'package:toolbox/features/ledger/domain/dedup.dart';
 
+var _billCounter = 0;
+
 RawBill _bill({
   required int amount,
   required EntryKind kind,
@@ -11,7 +13,7 @@ RawBill _bill({
 }) {
   return RawBill(
     sourceType: BillSourceType.alipayCsv,
-    sourceId: 'id-$amount-${time.toIso8601String()}',
+    sourceId: 'id-${_billCounter++}', // 确保每个账单有唯一 ID
     amountCents: amount,
     kind: kind,
     occurredAt: time,
