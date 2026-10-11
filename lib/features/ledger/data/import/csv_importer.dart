@@ -7,7 +7,6 @@ import 'package:drift/drift.dart';
 import '../../../../core/database/app_database.dart';
 import '../../domain/category_matcher.dart';
 import '../ledger_dao.dart';
-import '../ledger_tables.dart';
 import 'bill_source.dart';
 import 'parsers/alipay_parser.dart';
 import 'parsers/wechat_parser.dart';
@@ -54,10 +53,10 @@ class CsvImporter {
     // 1. 解析 CSV
     final parseResult = await parser.parse(content);
     if (parseResult.bills.isEmpty && parseResult.failures.isEmpty) {
-      return ImportResult(
+      return const ImportResult(
         imported: 0,
         skipped: 0,
-        failures: const ['文件内容为空或格式不支持'],
+        failures: ['文件内容为空或格式不支持'],
       );
     }
 
