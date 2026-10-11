@@ -1,6 +1,6 @@
 import 'package:csv/csv.dart';
 
-import '../../../../../core/database/app_database.dart';
+import '../../ledger_tables.dart';
 import '../bill_source.dart';
 
 /// 微信账单 CSV 解析器。
