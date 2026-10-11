@@ -5,7 +5,7 @@ import 'dart:typed_data';
 import 'package:charset_converter/charset_converter.dart';
 import 'package:drift/drift.dart';
 
-import '../../../core/database/app_database.dart';
+import '../../../../core/database/app_database.dart';
 import '../../domain/category_matcher.dart';
 import '../ledger_dao.dart';
 import '../ledger_tables.dart';

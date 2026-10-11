@@ -235,7 +235,7 @@ class _BillCard extends ConsumerWidget {
                     ),
                   ),
                   Text(
-                    '${isExpense ? '-' : '+'}${formatMoney(bill.amountCents)}',
+                    '${isExpense ? '-' : '+'}${formatCents(bill.amountCents)}',
                     style: theme.textTheme.titleLarge?.copyWith(
                       color: amountColor,
                       fontWeight: FontWeight.bold,
