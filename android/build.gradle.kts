@@ -15,6 +15,18 @@ subprojects {
     val newSubprojectBuildDir: Directory = newBuildDir.dir(project.name)
     project.layout.buildDirectory.value(newSubprojectBuildDir)
 }
+
+// 强制所有子项目（包括 Flutter 插件）使用 compileSdk 36
+subprojects {
+    afterEvaluate {
+        if (project.hasProperty("android")) {
+            extensions.configure<com.android.build.gradle.BaseExtension>("android") {
+                compileSdkVersion(36)
+            }
+        }
+    }
+}
+
 subprojects {
     project.evaluationDependsOn(":app")
 }
